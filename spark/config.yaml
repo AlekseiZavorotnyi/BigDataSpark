@@ -1,0 +1,14 @@
+source:
+  path: "/source_data/*.csv"
+
+postgres:
+  url: "jdbc:postgresql://postgres:5432/bigdata"
+  user: "admin"
+  password: "admin"
+  driver: "org.postgresql.Driver"
+
+clickhouse:
+  url: "jdbc:clickhouse://clickhouse:8123/default"
+  user: "default"
+  password: ""
+  driver: "com.clickhouse.jdbc.ClickHouseDriver"
