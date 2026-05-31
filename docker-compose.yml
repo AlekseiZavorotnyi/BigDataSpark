@@ -1,7 +1,6 @@
 services:
   postgres:
     image: postgres:15
-    container_name: pg
     environment:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: admin
@@ -9,32 +8,43 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
-      - ./source_data:/source_data
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./source_data:/source_data:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d bigdata"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     networks:
       - bigdata_net
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.1
-    container_name: ch
     ports:
       - "8123:8123"
       - "9000:9000"
     volumes:
-      - ./clickhouse_data:/var/lib/clickhouse
+      - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     networks:
       - bigdata_net
 
   spark:
     image: apache/spark:3.5.1-scala2.12-java11-python3-ubuntu
-    container_name: spark
+    user: root
+    working_dir: /opt/spark/work-dir/spark
     depends_on:
-      - postgres
-      - clickhouse
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
     volumes:
       - .:/opt/spark/work-dir
-      - ./source_data:/source_data
     ports:
       - "4040:4040"
       - "8080:8080"
@@ -43,8 +53,15 @@ services:
       - PYSPARK_PYTHON=python3
     networks:
       - bigdata_net
-    command: bash -c "apt-get update && apt-get install -y curl && tail -f /dev/null"
+    command: bash -lc "tail -f /dev/null"
 
 networks:
   bigdata_net:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 10.89.0.0/24
+
+volumes:
+  postgres_data:
+  clickhouse_data:

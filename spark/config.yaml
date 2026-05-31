@@ -8,7 +8,6 @@ postgres:
   driver: "org.postgresql.Driver"
 
 clickhouse:
-  url: "jdbc:clickhouse://clickhouse:8123/default"
+  http_url: "http://clickhouse:8123"
   user: "default"
   password: ""
-  driver: "com.clickhouse.jdbc.ClickHouseDriver"

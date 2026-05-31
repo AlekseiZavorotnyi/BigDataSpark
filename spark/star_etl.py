@@ -1,156 +1,334 @@
-import yaml
-import subprocess
-import sys
-import os
-from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
-def setup_jdbc_drivers():
-    jars_dir = "/opt/bitnami/spark/jars"
-    if not os.path.exists(jars_dir):
-        jars_dir = "/opt/spark/jars"
-    if not os.path.exists(jars_dir):
-        jars_dir = "./jars"
-        os.makedirs(jars_dir, exist_ok=True)
+from common import create_spark, execute_jdbc_statements, load_config, postgres_properties
 
-    pg_jar = os.path.join(jars_dir, "postgresql-42.7.1.jar")
-    if not os.path.exists(pg_jar):
-        print("Downloading PostgreSQL JDBC driver...")
-        subprocess.run([
-            "curl", "-L", "-o", pg_jar,
-            "https://jdbc.postgresql.org/download/postgresql-42.7.1.jar"
-        ], check=True)
 
-    ch_jar = os.path.join(jars_dir, "clickhouse-jdbc-0.6.3-shaded.jar")
-    if not os.path.exists(ch_jar):
-        print("Downloading ClickHouse JDBC driver...")
-        subprocess.run([
-            "curl", "-L", "-o", ch_jar,
-            "https://github.com/ClickHouse/clickhouse-java/releases/download/v0.6.3/clickhouse-jdbc-0.6.3-shaded.jar"
-        ], check=True)
+def create_dimension(df, columns, key_columns, key_name):
+    order_columns = [F.col(column).asc_nulls_last() for column in key_columns]
+    window = Window.orderBy(*order_columns)
 
-    return jars_dir
+    return (
+        df.select(*columns)
+        .dropDuplicates(key_columns)
+        .withColumn(key_name, F.row_number().over(window))
+        .select(key_name, *columns)
+    )
 
-jars_dir = setup_jdbc_drivers()
 
-with open("config.yaml") as f:
-    cfg = yaml.safe_load(f)
+def null_safe_join(left, right, pairs):
+    condition = None
+    for left_column, right_column in pairs:
+        part = F.col(left_column).eqNullSafe(F.col(right_column))
+        condition = part if condition is None else condition & part
+    return left.join(right, condition)
 
-spark = (
-    SparkSession.builder
-    .appName("BigDataSpark-Lab2")
-    .config("spark.sql.shuffle.partitions", "4")
-    .config("spark.sql.adaptive.enabled", "true")
-    .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-    .config("spark.jars", f"{jars_dir}/postgresql-42.7.1.jar,{jars_dir}/clickhouse-jdbc-0.6.3-shaded.jar")
-    .getOrCreate()
-)
 
-pg_url = cfg["postgres"]["url"]
-pg_properties = {
-    "user": cfg["postgres"]["user"],
-    "password": cfg["postgres"]["password"],
-    "driver": cfg["postgres"]["driver"]
-}
+def recreate_star_schema(spark, pg):
+    execute_jdbc_statements(
+        spark=spark,
+        url=pg["url"],
+        user=pg["user"],
+        password=pg["password"],
+        driver=pg["driver"],
+        statements=[
+            "DROP TABLE IF EXISTS fact_sales",
+            "DROP TABLE IF EXISTS dim_customer",
+            "DROP TABLE IF EXISTS dim_seller",
+            "DROP TABLE IF EXISTS dim_store",
+            "DROP TABLE IF EXISTS dim_supplier",
+            "DROP TABLE IF EXISTS dim_product",
+            "DROP TABLE IF EXISTS dim_date",
+            """
+            CREATE TABLE dim_customer (
+                customer_key INT PRIMARY KEY,
+                customer_first_name TEXT,
+                customer_last_name TEXT,
+                customer_age INT,
+                customer_email TEXT,
+                customer_country TEXT,
+                customer_postal_code TEXT,
+                customer_pet_type TEXT,
+                customer_pet_name TEXT,
+                customer_pet_breed TEXT
+            )
+            """,
+            """
+            CREATE TABLE dim_seller (
+                seller_key INT PRIMARY KEY,
+                seller_first_name TEXT,
+                seller_last_name TEXT,
+                seller_email TEXT,
+                seller_country TEXT,
+                seller_postal_code TEXT
+            )
+            """,
+            """
+            CREATE TABLE dim_store (
+                store_key INT PRIMARY KEY,
+                store_name TEXT,
+                store_location TEXT,
+                store_city TEXT,
+                store_state TEXT,
+                store_country TEXT,
+                store_phone TEXT,
+                store_email TEXT
+            )
+            """,
+            """
+            CREATE TABLE dim_supplier (
+                supplier_key INT PRIMARY KEY,
+                supplier_name TEXT,
+                supplier_contact TEXT,
+                supplier_email TEXT,
+                supplier_phone TEXT,
+                supplier_address TEXT,
+                supplier_city TEXT,
+                supplier_country TEXT
+            )
+            """,
+            """
+            CREATE TABLE dim_product (
+                product_key INT PRIMARY KEY,
+                product_name TEXT,
+                product_category TEXT,
+                product_brand TEXT,
+                product_color TEXT,
+                product_size TEXT,
+                product_material TEXT,
+                product_weight NUMERIC(12,2),
+                product_description TEXT,
+                pet_category TEXT,
+                supplier_name TEXT,
+                supplier_email TEXT
+            )
+            """,
+            """
+            CREATE TABLE dim_date (
+                date_key INT PRIMARY KEY,
+                full_date DATE,
+                year INT,
+                month INT,
+                day INT
+            )
+            """,
+            """
+            CREATE TABLE fact_sales (
+                sale_key BIGINT PRIMARY KEY,
+                customer_key INT,
+                seller_key INT,
+                product_key INT,
+                store_key INT,
+                supplier_key INT,
+                date_key INT,
+                quantity INT,
+                total_price NUMERIC(14,2),
+                unit_price NUMERIC(12,2),
+                product_rating NUMERIC(4,2),
+                product_reviews INT,
+                stock_quantity INT,
+                product_release_date DATE,
+                product_expiry_date DATE
+            )
+            """,
+        ],
+    )
 
-print("Reading mock_data from PostgreSQL...")
-df_raw = spark.read.jdbc(url=pg_url, table="mock_data", properties=pg_properties)
 
-print(f"Total rows loaded: {df_raw.count()}")
+def write_postgres(df, pg_url, table, properties):
+    df.write.mode("append").jdbc(url=pg_url, table=table, properties=properties)
+    print(f"{table}: {df.count()} rows")
 
-df = df_raw.withColumn("sale_date", F.to_date("sale_date", "yyyy-MM-dd"))
 
-print("Creating dimensions...")
+def main():
+    config = load_config()
+    pg = config["postgres"]
+    pg_url = pg["url"]
+    pg_props = postgres_properties(config)
 
-def create_dimension(df, cols, key_cols, name):
-    dim = df.select(*cols).dropDuplicates(key_cols)
-    w = Window.orderBy(F.monotonically_increasing_id())
-    dim = dim.withColumn(f"{name}_key", F.row_number().over(w))
-    print(f"  {name}: {dim.count()} rows")
-    return dim
+    spark = create_spark("BigDataSpark-Star-ETL")
+    spark.sparkContext.setLogLevel("WARN")
 
-dim_customer = create_dimension(df,
-    ["customer_first_name", "customer_last_name", "customer_age", "customer_email",
-     "customer_country", "customer_postal_code", "customer_pet_type", "customer_pet_name", "customer_pet_breed"],
-    ["customer_email"], "customer")
+    print("Reading mock_data from PostgreSQL")
+    raw = spark.read.jdbc(url=pg_url, table="mock_data", properties=pg_props)
+    df = raw.withColumn("sale_date", F.to_date("sale_date"))
+    raw_count = df.count()
+    print(f"mock_data: {raw_count} rows")
 
-dim_seller = create_dimension(df,
-    ["seller_first_name", "seller_last_name", "seller_email", "seller_country", "seller_postal_code"],
-    ["seller_email"], "seller")
+    recreate_star_schema(spark, pg)
 
-dim_store = create_dimension(df,
-    ["store_name", "store_location", "store_city", "store_state", "store_country", "store_phone", "store_email"],
-    ["store_name", "store_city", "store_country"], "store")
+    dim_customer = create_dimension(
+        df,
+        [
+            "customer_first_name",
+            "customer_last_name",
+            "customer_age",
+            "customer_email",
+            "customer_country",
+            "customer_postal_code",
+            "customer_pet_type",
+            "customer_pet_name",
+            "customer_pet_breed",
+        ],
+        ["customer_email"],
+        "customer_key",
+    )
 
-dim_supplier = create_dimension(df,
-    ["supplier_name", "supplier_contact", "supplier_email", "supplier_phone", "supplier_address",
-     "supplier_city", "supplier_country"],
-    ["supplier_name", "supplier_email"], "supplier")
+    dim_seller = create_dimension(
+        df,
+        ["seller_first_name", "seller_last_name", "seller_email", "seller_country", "seller_postal_code"],
+        ["seller_email"],
+        "seller_key",
+    )
 
-dim_product = create_dimension(df,
-    ["product_name", "product_category", "product_brand", "product_color", "product_size",
-     "product_material", "product_weight", "product_description", "pet_category", "supplier_name", "supplier_email"],
-    ["product_name", "product_brand", "product_size", "product_color"], "product")
+    dim_store = create_dimension(
+        df,
+        ["store_name", "store_location", "store_city", "store_state", "store_country", "store_phone", "store_email"],
+        ["store_name", "store_city", "store_country"],
+        "store_key",
+    )
 
-dim_date = (
-    df.select("sale_date")
-    .withColumnRenamed("sale_date", "full_date")
-    .filter(F.col("full_date").isNotNull())
-    .dropDuplicates(["full_date"])
-    .withColumn("year", F.year("full_date"))
-    .withColumn("month", F.month("full_date"))
-    .withColumn("day", F.dayofmonth("full_date"))
-    .withColumn("date_key", F.row_number().over(Window.orderBy("full_date")))
-)
-print(f"  date: {dim_date.count()} rows")
+    dim_supplier = create_dimension(
+        df,
+        [
+            "supplier_name",
+            "supplier_contact",
+            "supplier_email",
+            "supplier_phone",
+            "supplier_address",
+            "supplier_city",
+            "supplier_country",
+        ],
+        ["supplier_name", "supplier_email"],
+        "supplier_key",
+    )
 
-print("Writing dimensions to PostgreSQL...")
-for dim, name in [(dim_customer, "dim_customer"), (dim_seller, "dim_seller"),
-                  (dim_store, "dim_store"), (dim_supplier, "dim_supplier"),
-                  (dim_product, "dim_product"), (dim_date, "dim_date")]:
-    dim.write.mode("overwrite").jdbc(url=pg_url, table=name, properties=pg_properties)
-    print(f"  {name} written")
+    dim_product = create_dimension(
+        df,
+        [
+            "product_name",
+            "product_category",
+            "product_brand",
+            "product_color",
+            "product_size",
+            "product_material",
+            "product_weight",
+            "product_description",
+            "pet_category",
+            "supplier_name",
+            "supplier_email",
+        ],
+        ["product_name", "product_brand", "product_size", "product_color"],
+        "product_key",
+    )
 
-print("Reading dimensions back...")
-dimensions = {}
-for name in ["dim_customer", "dim_seller", "dim_store", "dim_supplier", "dim_product", "dim_date"]:
-    dimensions[name] = spark.read.jdbc(url=pg_url, table=name, properties=pg_properties)
+    dim_date = (
+        df.select(F.col("sale_date").alias("full_date"))
+        .filter(F.col("full_date").isNotNull())
+        .dropDuplicates(["full_date"])
+        .withColumn("year", F.year("full_date"))
+        .withColumn("month", F.month("full_date"))
+        .withColumn("day", F.dayofmonth("full_date"))
+        .withColumn("date_key", F.row_number().over(Window.orderBy("full_date")))
+        .select("date_key", "full_date", "year", "month", "day")
+    )
 
-print("Creating fact table...")
+    print("Writing dimensions to PostgreSQL")
+    write_postgres(dim_customer, pg_url, "dim_customer", pg_props)
+    write_postgres(dim_seller, pg_url, "dim_seller", pg_props)
+    write_postgres(dim_store, pg_url, "dim_store", pg_props)
+    write_postgres(dim_supplier, pg_url, "dim_supplier", pg_props)
+    write_postgres(dim_product, pg_url, "dim_product", pg_props)
+    write_postgres(dim_date, pg_url, "dim_date", pg_props)
 
-from pyspark.sql.functions import broadcast
+    print("Building fact_sales")
+    fact_source = df.alias("m")
+    fact = null_safe_join(fact_source, dim_customer.alias("dc"), [("m.customer_email", "dc.customer_email")])
+    fact = null_safe_join(fact, dim_seller.alias("ds"), [("m.seller_email", "ds.seller_email")])
+    fact = null_safe_join(
+        fact,
+        dim_store.alias("st"),
+        [
+            ("m.store_name", "st.store_name"),
+            ("m.store_city", "st.store_city"),
+            ("m.store_country", "st.store_country"),
+        ],
+    )
+    fact = null_safe_join(
+        fact,
+        dim_supplier.alias("sp"),
+        [("m.supplier_name", "sp.supplier_name"), ("m.supplier_email", "sp.supplier_email")],
+    )
+    fact = null_safe_join(
+        fact,
+        dim_product.alias("dp"),
+        [
+            ("m.product_name", "dp.product_name"),
+            ("m.product_brand", "dp.product_brand"),
+            ("m.product_size", "dp.product_size"),
+            ("m.product_color", "dp.product_color"),
+        ],
+    )
+    fact = null_safe_join(fact, dim_date.alias("dd"), [("m.sale_date", "dd.full_date")])
 
-fact = df.alias("m") \
-    .join(broadcast(dimensions["dim_customer"]).alias("dc"), df.customer_email == dimensions["dim_customer"].customer_email) \
-    .join(broadcast(dimensions["dim_seller"]).alias("ds"), df.seller_email == dimensions["dim_seller"].seller_email) \
-    .join(broadcast(dimensions["dim_store"]).alias("st"), df.store_name == dimensions["dim_store"].store_name) \
-    .join(broadcast(dimensions["dim_supplier"]).alias("sp"), df.supplier_email == dimensions["dim_supplier"].supplier_email) \
-    .join(broadcast(dimensions["dim_product"]).alias("dp"),
-          (df.product_name == dimensions["dim_product"].product_name) &
-          (df.product_brand == dimensions["dim_product"].product_brand)) \
-    .join(broadcast(dimensions["dim_date"]).alias("dd"), df.sale_date == dimensions["dim_date"].full_date)
+    fact_selected = (
+        fact.select(
+            F.col("dc.customer_key").alias("customer_key"),
+            F.col("ds.seller_key").alias("seller_key"),
+            F.col("dp.product_key").alias("product_key"),
+            F.col("st.store_key").alias("store_key"),
+            F.col("sp.supplier_key").alias("supplier_key"),
+            F.col("dd.date_key").alias("date_key"),
+            F.col("m.sale_quantity").cast("int").alias("quantity"),
+            F.col("m.sale_total_price").cast("decimal(14,2)").alias("total_price"),
+            F.col("m.product_price").cast("decimal(12,2)").alias("unit_price"),
+            F.col("m.product_rating").cast("decimal(4,2)").alias("product_rating"),
+            F.col("m.product_reviews").cast("int").alias("product_reviews"),
+            F.col("m.product_quantity").cast("int").alias("stock_quantity"),
+            F.to_date(F.col("m.product_release_date")).alias("product_release_date"),
+            F.to_date(F.col("m.product_expiry_date")).alias("product_expiry_date"),
+        )
+        .withColumn(
+            "sale_key",
+            F.row_number().over(
+                Window.orderBy(
+                    "date_key",
+                    "customer_key",
+                    "seller_key",
+                    "product_key",
+                    "store_key",
+                    "supplier_key",
+                    "total_price",
+                )
+            ),
+        )
+        .select(
+            "sale_key",
+            "customer_key",
+            "seller_key",
+            "product_key",
+            "store_key",
+            "supplier_key",
+            "date_key",
+            "quantity",
+            "total_price",
+            "unit_price",
+            "product_rating",
+            "product_reviews",
+            "stock_quantity",
+            "product_release_date",
+            "product_expiry_date",
+        )
+    )
 
-fact_selected = fact.select(
-    F.col("dc.customer_key"),
-    F.col("ds.seller_key"),
-    F.col("dp.product_key"),
-    F.col("st.store_key"),
-    F.col("sp.supplier_key"),
-    F.col("dd.date_key"),
-    F.col("m.sale_quantity").cast("int").alias("quantity"),
-    F.col("m.sale_total_price").cast("decimal(14,2)").alias("total_price"),
-    F.col("m.product_price").cast("decimal(12,2)").alias("unit_price"),
-    F.col("m.product_rating").cast("decimal(4,2)").alias("product_rating"),
-    F.col("m.product_reviews").cast("int").alias("product_reviews"),
-    F.col("m.product_quantity").cast("int").alias("stock_quantity"),
-    F.to_date("product_release_date", "yyyy-MM-dd").alias("product_release_date"),
-    F.to_date("product_expiry_date", "yyyy-MM-dd").alias("product_expiry_date"),
-)
+    write_postgres(fact_selected, pg_url, "fact_sales", pg_props)
+    fact_count = fact_selected.count()
 
-fact_selected.write.mode("overwrite").jdbc(url=pg_url, table="fact_sales", properties=pg_properties)
+    if fact_count != raw_count:
+        raise RuntimeError(f"fact_sales row count mismatch: expected {raw_count}, got {fact_count}")
 
-print("=" * 60)
-print("ETL completed successfully!")
-print(f"Fact rows: {fact_selected.count()}")
-print("=" * 60)
+    print("Star ETL completed successfully")
+
+
+if __name__ == "__main__":
+    main()
